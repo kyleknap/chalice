@@ -22,6 +22,7 @@ import shutil
 import json
 
 import botocore.session  # noqa
+from s3transfer.manager import TransferManager
 from typing import Any, Optional, Dict, Callable, List, Iterator  # noqa
 
 from chalice.constants import DEFAULT_STAGE_NAME
@@ -68,19 +69,22 @@ class TypedAWSClient(object):
     def create_function(self,
                         function_name,               # type: str
                         role_arn,                    # type: str
-                        zip_contents,                # type: str
                         runtime,                     # type: str
                         handler,                     # type: str
+                        zip_contents=None,           # type: str
                         environment_variables=None,  # type: _STR_MAP
                         tags=None,                   # type: _STR_MAP
                         timeout=None,                # type: _OPT_INT
-                        memory_size=None             # type: _OPT_INT
+                        memory_size=None,            # type: _OPT_INT
+                        s3_bucket=None,              # type: _OPT_STR
+                        s3_key=None                  # type: _OPT_STR
                         ):
         # type: (...) -> str
         kwargs = {
             'FunctionName': function_name,
             'Runtime': runtime,
-            'Code': {'ZipFile': zip_contents},
+            'Code': self._get_lambda_code_params(
+                zip_contents, s3_bucket, s3_key),
             'Handler': handler,
             'Role': role_arn,
         }  # type: Dict[str, Any]
@@ -94,6 +98,21 @@ class TypedAWSClient(object):
             kwargs['MemorySize'] = memory_size
         return self._call_client_method_with_retries(
             self._client('lambda').create_function, kwargs)['FunctionArn']
+
+    def _get_lambda_code_params(self,
+                                zip_contents=None,
+                                s3_bucket=None,
+                                s3_key=None
+                                ):
+        code_params = {}
+        if zip_contents:
+            code_params['ZipFile'] = zip_contents
+        elif s3_bucket and s3_key:
+            code_params['S3Bucket'] = s3_bucket
+            code_params['S3Key'] = s3_key
+        else:
+            raise ValueError()
+        return code_params
 
     def _call_client_method_with_retries(self, method, kwargs):
         # type: (_CLIENT_METHOD, Dict[str, Any]) -> Dict[str, Any]
@@ -124,13 +143,15 @@ class TypedAWSClient(object):
 
     def update_function(self,
                         function_name,               # type: str
-                        zip_contents,                # type: str
+                        zip_contents=None,           # type: _OPT_STR
                         environment_variables=None,  # type: _STR_MAP
                         runtime=None,                # type: _OPT_STR
                         tags=None,                   # type: _STR_MAP
                         timeout=None,                # type: _OPT_INT
                         memory_size=None,            # type: _OPT_INT
-                        role_arn=None                # type: _OPT_STR
+                        role_arn=None,               # type: _OPT_STR
+                        s3_bucket=None,              # type: _OPT_STR
+                        s3_key=None                  # type: _OPT_STR
                         ):
         # type: (...) -> Dict[str, Any]
         """Update a Lambda function's code and configuration.
@@ -141,8 +162,9 @@ class TypedAWSClient(object):
         """
         lambda_client = self._client('lambda')
         return_value = lambda_client.update_function_code(
-            FunctionName=function_name, ZipFile=zip_contents)
-
+            FunctionName=function_name, **self._get_lambda_code_params(
+                zip_contents, s3_bucket, s3_key)
+        )
         kwargs = {}  # type: Dict[str, Any]
         if environment_variables is not None:
             kwargs['Environment'] = {'Variables': environment_variables}
@@ -472,6 +494,16 @@ class TypedAWSClient(object):
                 event['timestamp'] = self._convert_to_datetime(
                     event['timestamp'])
                 yield event
+
+    def put_object(self, filename, bucket, key):
+        # type: (str, str) -> None
+        with TransferManager(self._client('s3')) as manager:
+            future = manager.upload(filename, bucket, key)
+        future.result()
+
+    def delete_object(self, bucket, key):
+        # type: (str, str) -> None
+        self._client('s3').delete_object(Bucket=bucket, Key=key)
 
     def _convert_to_datetime(self, integer_timestamp):
         # type: (int) -> datetime.datetime

@@ -238,6 +238,12 @@ class Config(object):
         # type: () -> Dict[str, str]
         return self._chain_merge('environment_variables')
 
+    @property
+    def s3_bucket(self):
+        # type: () -> str
+        return self._chain_lookup('s3_bucket',
+                                  varies_per_chalice_stage=True)
+
     def deployed_resources(self, chalice_stage_name):
         # type: (str) -> Optional[DeployedResources]
         """Return resources associated with a given stage.

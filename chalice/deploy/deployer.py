@@ -29,6 +29,8 @@ from chalice.policy import AppPolicyGenerator
 
 NULLARY = Callable[[], str]
 OPT_RESOURCES = Optional[DeployedResources]
+_STR_MAP = Dict[str, str]
+_OPT_STR_MAP = Optional[_STR_MAP]
 
 
 def create_default_deployer(session, prompter=None):
@@ -44,7 +46,9 @@ def create_default_deployer(session, prompter=None):
         aws_client, packager, prompter, osutils,
         ApplicationPolicyHandler(
             osutils, AppPolicyGenerator(osutils)))
-    return Deployer(api_gateway_deploy, lambda_deploy)
+
+    s3_deploy = S3Deployer(aws_client, packager, osutils)
+    return Deployer(api_gateway_deploy, lambda_deploy, s3_deploy)
 
 
 def validate_configuration(config):
@@ -169,6 +173,20 @@ def _validate_manage_iam_role(config):
             )
 
 
+def _get_deployment_zip_name_and_contents(packager, config, osutils):
+    project_dir = config.project_dir
+    deployment_package_filename = packager.deployment_package_filename(
+        project_dir)
+    if osutils.file_exists(deployment_package_filename):
+        packager.inject_latest_app(deployment_package_filename,
+                                   project_dir)
+    else:
+        deployment_package_filename = packager.create_deployment_package(
+            project_dir)
+    return deployment_package_filename, osutils.get_file_contents(
+        deployment_package_filename, binary=True)
+
+
 class NoPrompt(object):
     def confirm(self, text, default=False, abort=False):
         # type: (str, bool, bool) -> bool
@@ -179,10 +197,11 @@ class Deployer(object):
 
     BACKEND_NAME = 'api'
 
-    def __init__(self, apigateway_deploy, lambda_deploy):
-        # type: (APIGatewayDeployer, LambdaDeployer) -> None
+    def __init__(self, apigateway_deploy, lambda_deploy, s3_deploy):
+        # type: (APIGatewayDeployer, LambdaDeployer, S3Deployer) -> None
         self._apigateway_deploy = apigateway_deploy
         self._lambda_deploy = lambda_deploy
+        self._s3_deploy = s3_deploy
 
     def delete(self, config, chalice_stage_name=DEFAULT_STAGE_NAME):
         # type: (Config, str) -> None
@@ -208,8 +227,17 @@ class Deployer(object):
         """
         validate_configuration(config)
         existing_resources = config.deployed_resources(chalice_stage_name)
-        deployed_values = self._lambda_deploy.deploy(
-            config, existing_resources, chalice_stage_name)
+        deployed_values = {}
+        s3_object = None
+        if config.s3_bucket:
+            bucket, key = self._s3_deploy.deploy(config)
+            s3_object = {
+                'bucket': bucket,
+                'key': key
+            }
+            deployed_values['s3_object'] = s3_object
+        deployed_values.update(self._lambda_deploy.deploy(
+            config, existing_resources, chalice_stage_name, s3_object))
         deployed_values.update({
             'backend': self.BACKEND_NAME,
             'chalice_version': chalice_version,
@@ -262,8 +290,13 @@ class LambdaDeployer(object):
                 print('Deleting role name %s' % role_name)
                 self._aws_client.delete_role(role_name)
 
-    def deploy(self, config, existing_resources, stage_name):
-        # type: (Config, OPT_RESOURCES, str) -> Dict[str, Any]
+    def deploy(self,
+               config,              # type: Config
+               existing_resources,  # type: OPT_RESOURCES
+               stage_name,          # type: str
+               s3_object=None       # type: _OPT_STR_MAP
+               ):
+        # type: (...) -> Dict[str, Any]
         deployed_values = {}
         if existing_resources is not None and \
                 self._aws_client.lambda_function_exists(
@@ -271,13 +304,14 @@ class LambdaDeployer(object):
             handler_name = existing_resources.api_handler_name
             self._confirm_any_runtime_changes(config, handler_name)
             self._get_or_create_lambda_role_arn(config, handler_name)
-            self._update_lambda_function(config, handler_name, stage_name)
+            self._update_lambda_function(
+                config, handler_name, stage_name, s3_object)
             function_arn = existing_resources.api_handler_arn
             deployed_values['api_handler_name'] = handler_name
         else:
             function_name = '%s-%s' % (config.app_name, stage_name)
             function_arn = self._first_time_lambda_create(
-                config, function_name, stage_name)
+                config, function_name, stage_name, s3_object)
             deployed_values['api_handler_name'] = function_name
         deployed_values['api_handler_arn'] = function_arn
         return deployed_values
@@ -346,29 +380,31 @@ class LambdaDeployer(object):
                                          policy_document=app_policy)
         self._app_policy.record_policy(config, app_policy)
 
-    def _first_time_lambda_create(self, config, function_name, stage_name):
-        # type: (Config, str, str) -> str
+    def _first_time_lambda_create(self,
+                                  config,         # type: Config
+                                  function_name,  # type: str
+                                  stage_name,     # type: str
+                                  s3_object=None  # type: _OPT_STR_MAP
+                                  ):
+        # type: (...) -> str
         # Creates a lambda function and returns the
         # function arn.
         # First we need to create a deployment package.
         print("Initial creation of lambda function.")
         role_arn = self._get_or_create_lambda_role_arn(config, function_name)
-        zip_filename = self._packager.create_deployment_package(
-            config.project_dir)
-        zip_contents = self._osutils.get_file_contents(
-            zip_filename, binary=True)
-
-        return self._aws_client.create_function(
-            function_name=function_name,
-            role_arn=role_arn,
-            zip_contents=zip_contents,
-            environment_variables=config.environment_variables,
-            runtime=config.lambda_python_version,
-            tags=config.tags,
-            handler='app.app',
-            timeout=self._get_lambda_timeout(config),
-            memory_size=self._get_lambda_memory_size(config)
-        )
+        create_function_kwargs = {
+            'function_name': function_name,
+            'role_arn': role_arn,
+            'environment_variables': config.environment_variables,
+            'runtime': config.lambda_python_version,
+            'tags': config.tags,
+            'handler': 'app.app',
+            'timeout': self._get_lambda_timeout(config),
+            'memory_size': self._get_lambda_memory_size(config)
+        }
+        create_function_kwargs.update(
+            self._get_lambda_source_code_params(config, s3_object))
+        return self._aws_client.create_function(**create_function_kwargs)
 
     def _get_lambda_timeout(self, config):
         # type: (Config) -> int
@@ -382,33 +418,39 @@ class LambdaDeployer(object):
             return DEFAULT_LAMBDA_MEMORY_SIZE
         return config.lambda_memory_size
 
-    def _update_lambda_function(self, config, lambda_name, stage_name):
-        # type: (Config, str, str) -> None
-        print("Updating lambda function...")
-        project_dir = config.project_dir
-        packager = self._packager
-        deployment_package_filename = packager.deployment_package_filename(
-            project_dir)
-        if self._osutils.file_exists(deployment_package_filename):
-            packager.inject_latest_app(deployment_package_filename,
-                                       project_dir)
+    def _get_lambda_source_code_params(self, config, s3_object):
+        params = {}
+        if s3_object:
+            params['s3_bucket'] = s3_object['bucket']
+            params['s3_key'] = s3_object['key']
         else:
-            deployment_package_filename = packager.create_deployment_package(
-                project_dir)
-        zip_contents = self._osutils.get_file_contents(
-            deployment_package_filename, binary=True)
+            _, zip_contents = _get_deployment_zip_name_and_contents(
+                self._packager, config, self._osutils)
+            params['zip_contents'] = zip_contents
+        return params
+
+    def _update_lambda_function(self,
+                                config,         # type: Config
+                                lambda_name,    # type: str
+                                stage_name,     # type: str
+                                s3_object=None  # type: _OPT_STR_MAP
+                                ):
+        # type: (...) -> None
+        print("Updating lambda function...")
         role_arn = self._get_or_create_lambda_role_arn(config, lambda_name)
+        update_function_kwargs = {
+            'function_name': lambda_name,
+            'runtime': config.lambda_python_version,
+            'environment_variables': config.environment_variables,
+            'tags': config.tags,
+            'timeout': self._get_lambda_timeout(config),
+            'memory_size': self._get_lambda_memory_size(config),
+            'role_arn': role_arn
+        }
+        update_function_kwargs.update(
+            self._get_lambda_source_code_params(config, s3_object))
         print("Sending changes to lambda.")
-        self._aws_client.update_function(
-            function_name=lambda_name,
-            zip_contents=zip_contents,
-            runtime=config.lambda_python_version,
-            environment_variables=config.environment_variables,
-            tags=config.tags,
-            timeout=self._get_lambda_timeout(config),
-            memory_size=self._get_lambda_memory_size(config),
-            role_arn=role_arn
-        )
+        self._aws_client.update_function(**update_function_kwargs)
 
     def _write_config_to_disk(self, config):
         # type: (Config) -> None
@@ -506,6 +548,31 @@ class APIGatewayDeployer(object):
             rest_api_id,
             str(uuid.uuid4()),
         )
+
+
+class S3Deployer(object):
+    _KEY_FORMAT = (
+        'chalice-app-source-code/{app_name}/{stage_name}/{checksum}.zip'
+    )
+
+    def __init__(self, aws_client, packager, osutils):
+        # type: (TypedAWSClient) -> None
+        self._aws_client = aws_client
+        self._packager = packager
+        self._osutils = osutils
+
+    def deploy(self, config):
+        bucket = config.s3_bucket
+        key = self._KEY_FORMAT.format(
+            app_name=config.app_name, stage_name='bar',
+            checksum='foo')
+        filename, _ = _get_deployment_zip_name_and_contents(
+            self._packager, config, self._osutils)
+        self._aws_client.put_object(filename, bucket, key)
+        return bucket, key
+
+    def delete(self, existing_resources):
+        pass
 
 
 class ApplicationPolicyHandler(object):

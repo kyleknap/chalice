@@ -12,6 +12,7 @@ install_requires = [
     'virtualenv>=15.0.0,<16.0.0',
     'typing==3.5.3.0',
     'six>=1.10.0,<2.0.0',
+    's3transfer>=0.1.10,<0.2.0',
 ]
 
 setup(
